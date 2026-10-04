@@ -3,147 +3,234 @@
 # Can use for any project; commercial or not. 
 # You're not allowed to reupload and claim as your own.
 # Do not use for AI training in any form or fashion.
-# Prophecy Mural (RPG Maker VX Ace / RGSS3)
-# Deltarune Ch.4-style glass tapestry: a shimmering glass panel with a picture
-# and typewriter-style prophecy text.
+# Prophecy Mural - (RPG Maker VX Ace / RGSS3)
+# Turns an event into an animated mural that sits on the map: it scrolls with
+# the map, the player walks around it, and it only animates while on screen.
+# Look: layered copies of your picture that blend, drift, ripple and color-cycle,
+# with purple prophecy text that fades in when the player gets close.
 #
-# Setup:
-#   - Put your mural art in Graphics/Pictures (about 340x190 works best;
-#     larger images are scaled down to fit).
-#   - In an event, use a Script command:
-#       prophecy("mural01", "THE PROPHECY, WHICH WHISPERS", "OF THREE WHO COME")
-#   - Press OK/Cancel to finish typing instantly, then again to close.
+# SETUP
+#   1. Make an event, leave its graphic empty. Put it on the BOTTOM-CENTER tile
+#      of where the mural should be (the picture grows upward from the event).
+#      Through OFF = solid, players walk around it. Through ON = walk through.
+#   2. Add a Comment command to the event page with:
+#        <mural: png>
+#        <mural_text: text 1 | text 2>
+#      "|" starts a new line of text.
+#   3. Art goes in Graphics/Pictures. Optional second layer: SNAS_b.png (for
+#      example a rippling texture). If it doesn't exist, SNAS is reused.
+#
+# OPTIONAL TAGS (same Comment)
+#   <mural_range: 5>        tiles at which text fades in (0 = always visible)
+#   <mural_offset: 0, -8>   shift the mural in pixels (x, y)
+#
+# Changing event pages (switches etc.) swaps or removes the mural automatically.
 #==============================================================================
 
-class Scene_Prophecy < Scene_Base
-  PW = 380          # panel width
-  PH = 300          # panel height
-  PIC_H = 190       # max picture height
-  TYPE_SPEED = 2    # frames per character
-  TEXT_COLOR = Color.new(200, 235, 255)
+module ProphecyMural
+  SUFFIX     = "_b"                       # second layer file suffix
+  RANGE      = 5                          # default text fade-in range (tiles)
+  Z          = 1                          # above floor tiles, below characters
+  FONT_NAME  = nil                        # e.g. "Determination Mono"
+  FONT_SIZE  = 18
+  TEXT_COLOR = Color.new(185, 130, 235)
+end
 
-  class << self
-    attr_accessor :pic, :lines
+#------------------------------------------------------------------------------
+# Game_Event: read the mural tags from the current page's comments
+#------------------------------------------------------------------------------
+class Game_Event
+  attr_reader :mural_data
+
+  alias prophecy_mural_setup_page setup_page
+  def setup_page(new_page)
+    prophecy_mural_setup_page(new_page)
+    @mural_data = @page ? parse_mural_comments : nil
   end
 
-  def initialize
-    @pic   = Scene_Prophecy.pic
-    @lines = Scene_Prophecy.lines.map { |l| l.to_s.upcase }
-    @total = @lines.inject(0) { |s, l| s + l.size }
-    @shown = 0
-    @t     = 0
-  end
-
-  def start
-    super
-    @dim = Sprite.new
-    @dim.bitmap = Bitmap.new(Graphics.width, Graphics.height)
-    @dim.bitmap.fill_rect(@dim.bitmap.rect, Color.new(0, 0, 16, 180))
-    @dim.opacity = 0
-    @vp = Viewport.new((Graphics.width - PW) / 2, (Graphics.height - PH) / 2, PW, PH)
-    @vp.z = 200
-    @vp.color = Color.new(0, 0, 16, 255)
-    make_panel
-    make_picture
-    make_shimmer
-    make_text
-  end
-
-  def make_panel
-    @panel = Sprite.new(@vp)
-    bmp = Bitmap.new(PW, PH)
-    bmp.gradient_fill_rect(0, 0, PW, PH, Color.new(40, 70, 130, 210),
-                           Color.new(120, 180, 230, 170), true)
-    edge = Color.new(210, 240, 255, 230)
-    bmp.fill_rect(0, 0, PW, 2, edge)
-    bmp.fill_rect(0, PH - 2, PW, 2, edge)
-    bmp.fill_rect(0, 0, 2, PH, edge)
-    bmp.fill_rect(PW - 2, 0, 2, PH, edge)
-    bmp.fill_rect(8, 8, PW - 16, 1, Color.new(255, 255, 255, 90))
-    @panel.bitmap = bmp
-  end
-
-  def make_picture
-    @picture = Sprite.new(@vp)
-    bmp = Cache.picture(@pic)
-    @picture.bitmap = bmp
-    @picture.ox = bmp.width / 2
-    @picture.oy = bmp.height / 2
-    @picture.x = PW / 2
-    @picture.y = 16 + PIC_H / 2
-    z = [(PW - 40.0) / bmp.width, PIC_H.to_f / bmp.height, 1.0].min
-    @picture.zoom_x = @picture.zoom_y = z
-    @picture.opacity = 235
-  end
-
-  def make_shimmer
-    @shimmer = Sprite.new(@vp)
-    bmp = Bitmap.new(60, PH)
-    60.times do |x|
-      a = (Math.sin(Math::PI * x / 60.0) * 70).to_i
-      bmp.fill_rect(x, 0, 1, PH, Color.new(255, 255, 255, a))
+  def parse_mural_comments
+    return nil unless @list
+    text = ""
+    @list.each do |cmd|
+      text << cmd.parameters[0].to_s << " " if cmd.code == 108 || cmd.code == 408
     end
-    @shimmer.bitmap = bmp
-    @shimmer.blend_type = 1
-    @shimmer.x = -120
-  end
-
-  def make_text
-    @text = Sprite.new(@vp)
-    @text.bitmap = Bitmap.new(PW, PH - PIC_H - 24)
-    @text.y = PIC_H + 24
-    @text.bitmap.font.size = 20
-    @text.bitmap.font.color = TEXT_COLOR
-  end
-
-  def redraw_text
-    bmp = @text.bitmap
-    bmp.clear
-    left = @shown
-    @lines.each_with_index do |line, i|
-      break if left <= 0
-      bmp.draw_text(0, i * 24, PW, 24, line[0, left], 1)
-      left -= line.size
+    return nil unless text =~ /<mural:\s*([^>]+?)\s*>/i
+    data = { :pic => $1.strip, :lines => [], :ox => 0, :oy => 0,
+             :range => ProphecyMural::RANGE }
+    if text =~ /<mural_text:\s*([^>]+?)\s*>/i
+      data[:lines] = $1.split("|").map { |l| l.strip.upcase }
     end
-  end
-
-  def update
-    super
-    @t += 1
-    @dim.opacity = [@t * 8, 255].min
-    @vp.color = Color.new(0, 0, 16, [255 - @t * 6, 0].max)
-    @shimmer.x = (@t * 3) % (PW + 240) - 120
-    @picture.y = 16 + PIC_H / 2 + (Math.sin(@t / 30.0) * 3).round
-    if @t > 40 && @shown < @total && @t % TYPE_SPEED == 0
-      @shown += 1
-      redraw_text
+    if text =~ /<mural_range:\s*(\d+)\s*>/i
+      data[:range] = $1.to_i
     end
-    if Input.trigger?(:C) || Input.trigger?(:B)
-      if @shown < @total
-        @shown = @total
-        redraw_text
-      else
-        Sound.play_cancel
-        return_scene
-      end
+    if text =~ /<mural_offset:\s*(-?\d+)\s*,\s*(-?\d+)\s*>/i
+      data[:ox] = $1.to_i
+      data[:oy] = $2.to_i
     end
-  end
-
-  def terminate
-    super
-    [@dim, @panel, @picture, @shimmer, @text].each do |s|
-      s.bitmap.dispose if s.bitmap && s != @picture
-      s.dispose
-    end
-    @vp.dispose
+    data
   end
 end
 
-class Game_Interpreter
-  def prophecy(pic, *lines)
-    Scene_Prophecy.pic = pic
-    Scene_Prophecy.lines = lines
-    SceneManager.call(Scene_Prophecy)
-    Fiber.yield
+#------------------------------------------------------------------------------
+# Sprite_Mural: the animated layers + text for one event
+#------------------------------------------------------------------------------
+class Sprite_Mural
+  attr_reader :data
+
+  def initialize(viewport, event, data)
+    @event = event
+    @data  = data
+    @t     = 0
+    @text_alpha = 0
+    base   = Cache.picture(data[:pic])
+    second = (Cache.picture(data[:pic] + ProphecyMural::SUFFIX) rescue base)
+    @w = base.width
+    @h = base.height
+
+    @ghost = make_layer(viewport, base, ProphecyMural::Z)
+    @main  = make_layer(viewport, base, ProphecyMural::Z + 1)
+    @blend = make_layer(viewport, second, ProphecyMural::Z + 2)
+    @blend.blend_type  = 1
+    @blend.wave_amp    = 2
+    @blend.wave_length = 32
+    @blend.wave_speed  = 240
+    make_text(viewport) unless data[:lines].empty?
+    update
+  end
+
+  def make_layer(viewport, bmp, z)
+    s = Sprite.new(viewport)
+    s.bitmap = bmp
+    s.ox = bmp.width / 2
+    s.oy = bmp.height
+    s.z  = z
+    s.opacity = 0
+    s
+  end
+
+  def make_text(viewport)
+    lines = @data[:lines]
+    temp = Bitmap.new(8, 8)
+    temp.font.name = ProphecyMural::FONT_NAME if ProphecyMural::FONT_NAME
+    temp.font.size = ProphecyMural::FONT_SIZE
+    width = lines.map { |l| temp.text_size(l).width }.max.to_i + 8
+    temp.dispose
+    lh = ProphecyMural::FONT_SIZE + 6
+    @text = Sprite.new(viewport)
+    @text.bitmap = Bitmap.new(width, lines.size * lh + 4)
+    @text.bitmap.font.name = ProphecyMural::FONT_NAME if ProphecyMural::FONT_NAME
+    @text.bitmap.font.size = ProphecyMural::FONT_SIZE
+    @text.bitmap.font.color = ProphecyMural::TEXT_COLOR
+    lines.each_with_index do |l, i|
+      @text.bitmap.draw_text(0, i * lh, width, lh, l, 1)
+    end
+    @text.ox = width / 2
+    @text.oy = @text.bitmap.height
+    @text.z  = ProphecyMural::Z + 3
+    @text.opacity = 0
+  end
+
+  def op(v)
+    [[v, 0].max, 255].min.to_i
+  end
+
+  def sprites
+    [@ghost, @main, @blend, @text].compact
+  end
+
+  def on_screen?(cx, by)
+    reach = [@w, (@text ? @text.bitmap.width : 0)].max / 2 + 16
+    cx + reach > 0 && cx - reach < Graphics.width &&
+      by + 16 > 0 && by - @h - 48 < Graphics.height
+  end
+
+  def update
+    cx = @event.screen_x + @data[:ox]
+    by = @event.screen_y + @data[:oy]
+    visible = on_screen?(cx, by)
+    sprites.each { |s| s.visible = visible }
+    return unless visible    # off screen: no animation work
+
+    @t += 1
+    f     = [@t / 60.0, 1.0].min
+    pulse = (Math.sin(@t / 40.0) + 1) / 2
+
+    @main.x = cx
+    @main.y = by
+    @main.opacity = op(255 * f)
+    @main.color = Color.new(200, 0, 50, (pulse * pulse * 120).to_i)
+
+    @blend.x = cx + (Math.sin(@t / 17.0) * 5).round
+    @blend.y = by + (Math.sin(@t / 23.0) * 2).round
+    @blend.opacity = op((110 + Math.sin(@t / 9.0) * 30) * f)
+    @blend.color = Color.new(255, 60, 200, 60)
+
+    @ghost.x = cx + 5 + (Math.sin(@t / 13.0) * 2).round
+    @ghost.y = by + 3
+    @ghost.opacity = op(90 * f)
+    @ghost.color = Color.new(60, 0, 80, 170)
+
+    if @text
+      range = @data[:range]
+      near = range == 0 || Math.hypot($game_player.real_x - @event.real_x,
+                                      $game_player.real_y - @event.real_y) <= range
+      @text_alpha += near ? 8 : -8
+      @text_alpha = [[@text_alpha, 0].max, 255].min
+      @text.x = cx
+      @text.y = by - @h - 4
+      @text.opacity = op(@text_alpha * f)
+    end
+  end
+
+  def dispose
+    @text.bitmap.dispose if @text
+    sprites.each { |s| s.dispose }   # cached picture bitmaps are left alone
+  end
+end
+
+#------------------------------------------------------------------------------
+# Spriteset_Map: keep one Sprite_Mural per event that has a mural tag
+#------------------------------------------------------------------------------
+class Spriteset_Map
+  alias prophecy_mural_create_characters create_characters
+  def create_characters
+    prophecy_mural_create_characters
+    @murals = {}
+  end
+
+  alias prophecy_mural_update update
+  def update
+    prophecy_mural_update
+    update_murals
+  end
+
+  alias prophecy_mural_dispose dispose
+  def dispose
+    dispose_murals
+    prophecy_mural_dispose
+  end
+
+  def update_murals
+    return unless @murals
+    $game_map.events.each do |id, ev|
+      data = ev.mural_data
+      spr  = @murals[id]
+      if spr && spr.data != data
+        spr.dispose
+        @murals.delete(id)
+        spr = nil
+      end
+      if data && !spr
+        @murals[id] = Sprite_Mural.new(@viewport1, ev, data)
+        spr = @murals[id]
+      end
+      spr.update if spr
+    end
+  end
+
+  def dispose_murals
+    return unless @murals
+    @murals.each_value { |s| s.dispose }
+    @murals.clear
   end
 end
