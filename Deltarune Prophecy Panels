@@ -1,0 +1,143 @@
+#==============================================================================
+# Script by ToneRasher
+# Can use for any project; commercial or not. 
+# You're not allowed to reupload and claim as your own.
+# Do not use for AI training in any form or fashion.
+# Prophecy Mural (RPG Maker VX Ace / RGSS3)
+# Deltarune Ch.4-style glass tapestry: a shimmering glass panel with a picture
+# and typewriter-style prophecy text.
+#
+# Setup:
+#   - Put your mural art in Graphics/Pictures (about 340x190 works best;
+#     larger images are scaled down to fit).
+#   - In an event, use a Script command:
+#       prophecy("mural01", "THE PROPHECY, WHICH WHISPERS", "OF THREE WHO COME")
+#   - Press OK/Cancel to finish typing instantly, then again to close.
+#==============================================================================
+
+class Scene_Prophecy < Scene_Base
+  PW = 380          # panel width
+  PH = 300          # panel height
+  PIC_H = 190       # max picture height
+  TYPE_SPEED = 2    # frames per character
+  TEXT_COLOR = Color.new(200, 235, 255)
+
+  def initialize(pic, *lines)
+    @pic   = pic
+    @lines = lines.map { |l| l.to_s.upcase }
+    @total = @lines.inject(0) { |s, l| s + l.size }
+    @shown = 0
+    @t     = 0
+  end
+
+  def start
+    super
+    @dim = Sprite.new
+    @dim.bitmap = Bitmap.new(Graphics.width, Graphics.height)
+    @dim.bitmap.fill_rect(@dim.bitmap.rect, Color.new(0, 0, 16, 180))
+    @dim.opacity = 0
+    @vp = Viewport.new((Graphics.width - PW) / 2, (Graphics.height - PH) / 2, PW, PH)
+    @vp.z = 200
+    @vp.color = Color.new(0, 0, 16, 255)
+    make_panel
+    make_picture
+    make_shimmer
+    make_text
+  end
+
+  def make_panel
+    @panel = Sprite.new(@vp)
+    bmp = Bitmap.new(PW, PH)
+    bmp.gradient_fill_rect(0, 0, PW, PH, Color.new(40, 70, 130, 210),
+                           Color.new(120, 180, 230, 170), true)
+    edge = Color.new(210, 240, 255, 230)
+    bmp.fill_rect(0, 0, PW, 2, edge)
+    bmp.fill_rect(0, PH - 2, PW, 2, edge)
+    bmp.fill_rect(0, 0, 2, PH, edge)
+    bmp.fill_rect(PW - 2, 0, 2, PH, edge)
+    bmp.fill_rect(8, 8, PW - 16, 1, Color.new(255, 255, 255, 90))
+    @panel.bitmap = bmp
+  end
+
+  def make_picture
+    @picture = Sprite.new(@vp)
+    bmp = Cache.picture(@pic)
+    @picture.bitmap = bmp
+    @picture.ox = bmp.width / 2
+    @picture.oy = bmp.height / 2
+    @picture.x = PW / 2
+    @picture.y = 16 + PIC_H / 2
+    z = [(PW - 40.0) / bmp.width, PIC_H.to_f / bmp.height, 1.0].min
+    @picture.zoom_x = @picture.zoom_y = z
+    @picture.opacity = 235
+  end
+
+  def make_shimmer
+    @shimmer = Sprite.new(@vp)
+    bmp = Bitmap.new(60, PH)
+    60.times do |x|
+      a = (Math.sin(Math::PI * x / 60.0) * 70).to_i
+      bmp.fill_rect(x, 0, 1, PH, Color.new(255, 255, 255, a))
+    end
+    @shimmer.bitmap = bmp
+    @shimmer.blend_type = 1
+    @shimmer.x = -120
+  end
+
+  def make_text
+    @text = Sprite.new(@vp)
+    @text.bitmap = Bitmap.new(PW, PH - PIC_H - 24)
+    @text.y = PIC_H + 24
+    @text.bitmap.font.size = 20
+    @text.bitmap.font.color = TEXT_COLOR
+  end
+
+  def redraw_text
+    bmp = @text.bitmap
+    bmp.clear
+    left = @shown
+    @lines.each_with_index do |line, i|
+      break if left <= 0
+      bmp.draw_text(0, i * 24, PW, 24, line[0, left], 1)
+      left -= line.size
+    end
+  end
+
+  def update
+    super
+    @t += 1
+    @dim.opacity = [@t * 8, 255].min
+    @vp.color = Color.new(0, 0, 16, [255 - @t * 6, 0].max)
+    @shimmer.x = (@t * 3) % (PW + 240) - 120
+    @picture.y = 16 + PIC_H / 2 + (Math.sin(@t / 30.0) * 3).round
+    if @t > 40 && @shown < @total && @t % TYPE_SPEED == 0
+      @shown += 1
+      redraw_text
+    end
+    if Input.trigger?(:C) || Input.trigger?(:B)
+      if @shown < @total
+        @shown = @total
+        redraw_text
+      else
+        Sound.play_cancel
+        return_scene
+      end
+    end
+  end
+
+  def terminate
+    super
+    [@dim, @panel, @picture, @shimmer, @text].each do |s|
+      s.bitmap.dispose if s.bitmap && s != @picture
+      s.dispose
+    end
+    @vp.dispose
+  end
+end
+
+class Game_Interpreter
+  def prophecy(pic, *lines)
+    SceneManager.call(Scene_Prophecy.new(pic, *lines))
+    Fiber.yield
+  end
+end
