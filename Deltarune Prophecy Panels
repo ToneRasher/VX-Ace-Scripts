@@ -22,9 +22,13 @@ class Scene_Prophecy < Scene_Base
   TYPE_SPEED = 2    # frames per character
   TEXT_COLOR = Color.new(200, 235, 255)
 
-  def initialize(pic, *lines)
-    @pic   = pic
-    @lines = lines.map { |l| l.to_s.upcase }
+  class << self
+    attr_accessor :pic, :lines
+  end
+
+  def initialize
+    @pic   = Scene_Prophecy.pic
+    @lines = Scene_Prophecy.lines.map { |l| l.to_s.upcase }
     @total = @lines.inject(0) { |s, l| s + l.size }
     @shown = 0
     @t     = 0
@@ -137,7 +141,9 @@ end
 
 class Game_Interpreter
   def prophecy(pic, *lines)
-    SceneManager.call(Scene_Prophecy.new(pic, *lines))
+    Scene_Prophecy.pic = pic
+    Scene_Prophecy.lines = lines
+    SceneManager.call(Scene_Prophecy)
     Fiber.yield
   end
 end
