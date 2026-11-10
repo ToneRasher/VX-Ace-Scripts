@@ -1,0 +1,516 @@
+#==============================================================================
+# ** AudioFX - Muffle, Visual, Loop Lock & Jump [RGSS3]
+# Please Credit ToneRasher in your project.
+# Loop Lock Requested by Axel FireForged
+#------------------------------------------------------------------------------
+#  Requires audioeffects.dll in the game folder (next to Game.exe).
+#  Put this script near the top of Materials, ABOVE any script that also
+#  rewrites the Audio module.
+#
+#  Script calls (Event > Script):
+#    AudioFX.muffle                             # muffle everything, fade in
+#    AudioFX.muffle(true, 60)                   # ...over 60 frames
+#    AudioFX.muffle(true, 30, [:bgm, :bgs])     # only some channels
+#    AudioFX.muffle(true, 30, :all, 400)        # custom cutoff in Hz
+#                                               # (lower = more muffled)
+#    AudioFX.clear                              # back to normal
+#    AudioFX.clear(60, :se)                     # one channel, over 60 frames
+#
+#  Or set MUFFLE_SWITCH below and just flip that game switch ON / OFF.
+#
+#  Encrypted games: any *.rgss3a in the game folder is read directly, so audio
+#  inside Game.rgss3a is muffled too.
+#
+#  Positions are in SECONDS (floats): Audio.bgm_pos / bgs_pos return seconds,
+#  and bgm_play / bgs_play take a start position in seconds. Playing the file
+#  that is already playing on BGM / BGS does NOT restart it (volume and pitch
+#  are just updated), so music carries on across maps.
+#  bgm_play / bgs_play also accept a 5th argument: fade-in time in
+#  milliseconds (same unit as Audio.bgm_fade), e.g.
+#    Audio.bgm_play("Audio/BGM/Theme2", 100, 100, Audio.bgm_pos, 1500)
+#
+#  Loop points and jumps for the track that is playing (BGM or BGS).
+#  In an event, write the notation in a COMMENT command or a SCRIPT command
+#  (both work; in a Script command the line is read as a tag, not as Ruby):
+#    BGM_Loop: 1:24.45          from now on, when the music loops it goes back
+#                               to 1:24.45 (the intro before it plays once)
+#    BGM_Loop: 1:24.45 - 3:10   ...and loops when it reaches 3:10 instead of the end
+#    BGM_Loop: reset            back to the file's own loop points
+#    BGM_Jump: 0:25             jump the music to 0:25 right now
+#  (BGS_Loop / BGS_Jump work the same way.) Times can be m:ss.xx, h:mm:ss,
+#  or plain seconds like 84.45. Several lines can go in one command. The
+#  Ruby-style Script calls also work:
+#    bgm_loop "1:24.45"          bgm_loop "1:24.45", "3:10"      bgm_loop_reset
+#    bgm_jump "0:25"             bgm_jump 25.5
+#  (from other scripts: Audio.bgm_loop / Audio.bgm_jump ...)
+#  The loop point belongs to the track that is playing: it survives map
+#  changes and save/load, and goes away when a different BGM starts.
+#
+#  Files the DLL plays: ogg (with LOOPSTART / LOOPLENGTH tags), wav, mp3, flac.
+#  Anything else (MIDI, WMA) or any file the script can't find (disk or
+#  archive) is handed to the stock Audio player untouched, so it just won't
+#  be muffled.
+#==============================================================================
+
+module AudioFX
+  #--------------------------------------------------------------------------
+  # * Settings
+  #--------------------------------------------------------------------------
+  DLL_NAME      = 'System/AudioFX.dll'
+  MUFFLE_HZ     = 700     # default cutoff when muffled
+  FADE_FRAMES   = 30      # default transition length (60 frames = 1 second)
+  MUFFLE_SWITCH = 0       # game switch ID that controls the muffle (0 = off)
+  RTP_PATHS     = []      # extra RTP folders, e.g.
+                          # ['D:/RTP/RPGVXAce/']  (common locations are
+                          # detected automatically)
+  ARCHIVES      = []      # extra .rgss3a files to read audio from; any
+                          # *.rgss3a in the game folder is picked up already
+
+  CLEAR_HZ = 20000
+  CHANNELS = { :bgm => 0, :bgs => 1, :me => 2, :se => 3 }
+  EXTS     = ['.ogg', '.wav', '.mp3', '.flac']
+  STOCK_ONLY_EXTS = ['.mid', '.midi', '.wma']
+
+  #--------------------------------------------------------------------------
+  # * Setup
+  #--------------------------------------------------------------------------
+  @enabled      = false
+  @arc_loaded   = false
+  @switch_state = nil
+  @path_cache   = {}
+  @cur_path     = {}
+  @loops        = {}
+  @cur = {}; @tgt = {}; @left = {}
+  CHANNELS.keys.each do |k|
+    @cur[k] = CLEAR_HZ.to_f
+    @tgt[k] = CLEAR_HZ.to_f
+    @left[k] = 0
+  end
+
+  begin
+    @f_init     = Win32API.new(DLL_NAME, 'AE_Init',      '',      'L')
+    @f_shutdown = Win32API.new(DLL_NAME, 'AE_Shutdown',  '',      'V')
+    @f_update   = Win32API.new(DLL_NAME, 'AE_Update',    '',      'V')
+    @f_play     = Win32API.new(DLL_NAME, 'AE_PlayEx',    'LPLLLL', 'L')
+    @f_stop     = Win32API.new(DLL_NAME, 'AE_Stop',      'L',     'V')
+    @f_fade     = Win32API.new(DLL_NAME, 'AE_Fade',      'LL',    'V')
+    @f_pos      = Win32API.new(DLL_NAME, 'AE_PosMs',     'L',     'L')
+    @f_playing  = Win32API.new(DLL_NAME, 'AE_Playing',   'L',     'L')
+    @f_cutoff   = Win32API.new(DLL_NAME, 'AE_SetCutoff', 'LL',    'V')
+    @f_setloop  = Win32API.new(DLL_NAME, 'AE_SetLoop',   'LLL',   'L')
+    @f_resetloop= Win32API.new(DLL_NAME, 'AE_ResetLoop', 'L',     'L')
+    @f_jump     = Win32API.new(DLL_NAME, 'AE_Jump',      'LL',    'L')
+    @f_arc_open = Win32API.new(DLL_NAME, 'AE_OpenArchive', 'P',   'L')
+    @f_arc_has  = Win32API.new(DLL_NAME, 'AE_InArchive',   'P',   'L')
+    @enabled = (@f_init.call != 0)
+    if @enabled
+      (Dir.glob('*.rgss3a') + ARCHIVES).each do |a|
+        @arc_loaded = true if @f_arc_open.call(a.to_s) > 0
+      end
+    end
+  rescue Exception => e
+    @enabled = false
+    print "AudioFX disabled: #{e.message}" if $TEST
+  end
+
+  #--------------------------------------------------------------------------
+  # * File lookup (project folder first, then RTP)
+  #--------------------------------------------------------------------------
+  def self.rtp_roots
+    @rtp_roots ||= begin
+      list = RTP_PATHS.dup
+      ['CommonProgramFiles(x86)', 'CommonProgramFiles'].each do |v|
+        base = ENV[v]
+        list << base.gsub("\\", "/") + "/Enterbrain/RGSS3/RPGVXAce/" if base
+      end
+      list << "C:/Program Files (x86)/Steam/steamapps/common/RPGVXAce/RTP/RPGVXAce/"
+      list = list.map { |p| p.end_with?("/") ? p : p + "/" }
+      list.select { |p| File.directory?(p) }
+    end
+  end
+
+  def self.find(filename)
+    return nil if filename.nil?
+    name = filename.to_s.gsub("\\", "/")
+    return nil if name.empty?
+    return @path_cache[name] if @path_cache.has_key?(name)
+    @path_cache[name] = lookup(name)
+  end
+
+  # a file on disk, or inside an encrypted archive
+  def self.exists?(path)
+    return true if File.file?(path)
+    @arc_loaded && @f_arc_has.call(path) != 0
+  end
+
+  def self.lookup(name)
+    return name if EXTS.include?(File.extname(name).downcase) && exists?(name)
+    EXTS.each { |e| return name + e if exists?(name + e) }
+    # a MIDI/WMA in the project beats an RTP ogg of the same name
+    STOCK_ONLY_EXTS.each { |e| return nil if exists?(name + e) }
+    rtp_roots.each do |root|
+      path = root + name
+      EXTS.each { |e| return path + e if File.file?(path + e) }
+    end
+    nil
+  end
+
+  #--------------------------------------------------------------------------
+  # * Playback (called by the Audio overrides below)
+  #--------------------------------------------------------------------------
+  def self.enabled?; @enabled; end
+
+  # pos in seconds, fade_in in milliseconds
+  def self.play(ch, filename, volume, pitch, pos, fade_in = 0)
+    return false unless @enabled
+    path = find(filename)
+    return false unless path
+    ok = @f_play.call(CHANNELS[ch], path, volume.to_i, pitch.to_i,
+                      secs_to_ms(pos), [fade_in.to_i, 0].max) != 0
+    if ok && (ch == :bgm || ch == :bgs)
+      @cur_path[ch] = norm_name(path)
+      restore_loop(ch)
+    else
+      @cur_path.delete(ch)
+    end
+    ok
+  end
+
+  #--------------------------------------------------------------------------
+  # * Loop points / jumps (BGM and BGS)
+  #--------------------------------------------------------------------------
+  # "1:24.45", "0:25", "1:02:03.5", "84.45" or a number -> seconds (nil if bad)
+  def self.parse_time(t)
+    return t.to_f if t.is_a?(Numeric)
+    s = t.to_s.strip
+    return nil unless s =~ /\A\d+(?::\d+){0,2}(?:\.\d+)?\z/
+    parts = s.split(":")
+    secs = parts.pop.to_f
+    mult = 60.0
+    until parts.empty?
+      secs += parts.pop.to_i * mult
+      mult *= 60.0
+    end
+    secs
+  end
+
+  def self.norm_name(path)
+    path.to_s.gsub("\\", "/").downcase
+  end
+
+  # the loop points live in $game_system so they are saved with the game
+  def self.loop_store
+    return @loops if $game_system.nil?
+    $game_system.audiofx_loops ||= {}
+  end
+
+  # applies the stored loop point if it belongs to the track now playing,
+  # forgets it if a different track has started
+  def self.restore_loop(ch)
+    entry = loop_store[ch]
+    return unless entry
+    if entry[0] == @cur_path[ch]
+      @f_setloop.call(CHANNELS[ch], entry[1], entry[2])
+    else
+      loop_store.delete(ch)
+    end
+  end
+
+  # start: where the loop returns to; finish: where it loops from (nil = end)
+  def self.set_loop(ch, start, finish = nil)
+    return false unless @enabled && (ch == :bgm || ch == :bgs) && @cur_path[ch]
+    s = parse_time(start)
+    return false if s.nil? || s < 0
+    e = finish.nil? ? 0.0 : parse_time(finish)
+    return false if e.nil?
+    s_ms = secs_to_ms(s)
+    e_ms = secs_to_ms(e)
+    return false if @f_setloop.call(CHANNELS[ch], s_ms, e_ms) == 0
+    loop_store[ch] = [@cur_path[ch], s_ms, e_ms]
+    true
+  end
+
+  def self.reset_loop(ch)
+    return false unless @enabled && (ch == :bgm || ch == :bgs)
+    loop_store.delete(ch)
+    @f_resetloop.call(CHANNELS[ch]) != 0
+  end
+
+  def self.jump(ch, time)
+    return false unless @enabled && (ch == :bgm || ch == :bgs)
+    s = parse_time(time)
+    return false if s.nil? || s < 0
+    @f_jump.call(CHANNELS[ch], secs_to_ms(s)) != 0
+  end
+
+  # seconds -> milliseconds; nonsense values (e.g. frame counts stored in old
+  # saves) become 0 so the track just starts from the top
+  def self.secs_to_ms(sec)
+    s = sec.to_f
+    return 0 if s <= 0.0 || s > 86400.0
+    (s * 1000).round
+  end
+
+  def self.stop(ch)
+    @f_stop.call(CHANNELS[ch]) if @enabled
+  end
+
+  def self.fade(ch, ms)
+    @f_fade.call(CHANNELS[ch], ms.to_i) if @enabled
+  end
+
+  def self.pos(ch)
+    @enabled ? @f_pos.call(CHANNELS[ch]) / 1000.0 : 0.0
+  end
+
+  def self.playing?(ch)
+    @enabled && @f_playing.call(CHANNELS[ch]) != 0
+  end
+
+  #--------------------------------------------------------------------------
+  # * Muffle control
+  #--------------------------------------------------------------------------
+  def self.muffle(on = true, frames = FADE_FRAMES, channels = :all, hz = MUFFLE_HZ)
+    target = on ? hz.to_f : CLEAR_HZ.to_f
+    keys = (channels == :all) ? CHANNELS.keys : [channels].flatten
+    keys.each do |k|
+      next unless CHANNELS.has_key?(k)
+      @tgt[k]  = target
+      @left[k] = [frames.to_i, 1].max
+    end
+  end
+
+  def self.clear(frames = FADE_FRAMES, channels = :all)
+    muffle(false, frames, channels)
+  end
+
+  def self.muffled?(ch = :bgm)
+    @tgt[ch] < CLEAR_HZ
+  end
+
+  #--------------------------------------------------------------------------
+  # * Per-frame update (hooked into Graphics.update)
+  #--------------------------------------------------------------------------
+  def self.update
+    return unless @enabled
+    @f_update.call
+    check_switch
+    CHANNELS.each do |k, id|
+      next if @left[k] <= 0
+      if @left[k] <= 1
+        @cur[k] = @tgt[k]
+      else
+        # glide in log-frequency so the sweep sounds even
+        @cur[k] *= (@tgt[k] / @cur[k]) ** (1.0 / @left[k])
+      end
+      @left[k] -= 1
+      @f_cutoff.call(id, @cur[k].round)
+    end
+  end
+
+  def self.check_switch
+    return if MUFFLE_SWITCH <= 0 || $game_switches.nil?
+    state = $game_switches[MUFFLE_SWITCH] ? true : false
+    return if state == @switch_state
+    @switch_state = state
+    state ? muffle : clear
+  end
+
+  def self.shutdown
+    @f_shutdown.call if @enabled
+    @enabled = false
+  end
+end
+
+at_exit { AudioFX.shutdown }
+
+#==============================================================================
+# ** Audio (module) - route through AudioFX, fall back to the stock player
+#==============================================================================
+class << Audio
+  alias_method :afx_bgm_play, :bgm_play
+  alias_method :afx_bgm_stop, :bgm_stop
+  alias_method :afx_bgm_fade, :bgm_fade
+  alias_method :afx_bgm_pos,  :bgm_pos
+  alias_method :afx_bgs_play, :bgs_play
+  alias_method :afx_bgs_stop, :bgs_stop
+  alias_method :afx_bgs_fade, :bgs_fade
+  alias_method :afx_bgs_pos,  :bgs_pos
+  alias_method :afx_me_play,  :me_play
+  alias_method :afx_me_stop,  :me_stop
+  alias_method :afx_me_fade,  :me_fade
+  alias_method :afx_se_play,  :se_play
+  alias_method :afx_se_stop,  :se_stop
+
+  def bgm_play(filename, volume = 100, pitch = 100, pos = 0, fade_in = 0)
+    if AudioFX.play(:bgm, filename, volume, pitch, pos, fade_in)
+      afx_bgm_stop
+    else
+      AudioFX.stop(:bgm)
+      afx_bgm_play(filename, volume, pitch, pos)
+    end
+  end
+
+  def bgm_stop
+    AudioFX.stop(:bgm)
+    afx_bgm_stop
+  end
+
+  def bgm_fade(time)
+    AudioFX.fade(:bgm, time)
+    afx_bgm_fade(time)
+  end
+
+  def bgm_pos
+    AudioFX.playing?(:bgm) ? AudioFX.pos(:bgm) : afx_bgm_pos
+  end
+
+  def bgs_play(filename, volume = 100, pitch = 100, pos = 0, fade_in = 0)
+    if AudioFX.play(:bgs, filename, volume, pitch, pos, fade_in)
+      afx_bgs_stop
+    else
+      AudioFX.stop(:bgs)
+      afx_bgs_play(filename, volume, pitch, pos)
+    end
+  end
+
+  def bgs_stop
+    AudioFX.stop(:bgs)
+    afx_bgs_stop
+  end
+
+  def bgs_fade(time)
+    AudioFX.fade(:bgs, time)
+    afx_bgs_fade(time)
+  end
+
+  def bgs_pos
+    AudioFX.playing?(:bgs) ? AudioFX.pos(:bgs) : afx_bgs_pos
+  end
+
+  def me_play(filename, volume = 100, pitch = 100)
+    if AudioFX.play(:me, filename, volume, pitch, 0)
+      afx_me_stop
+    else
+      AudioFX.stop(:me)
+      afx_me_play(filename, volume, pitch)
+    end
+  end
+
+  def me_stop
+    AudioFX.stop(:me)
+    afx_me_stop
+  end
+
+  def me_fade(time)
+    AudioFX.fade(:me, time)
+    afx_me_fade(time)
+  end
+
+  def se_play(filename, volume = 100, pitch = 100)
+    unless AudioFX.play(:se, filename, volume, pitch, 0)
+      afx_se_play(filename, volume, pitch)
+    end
+  end
+
+  def se_stop
+    AudioFX.stop(:se)
+    afx_se_stop
+  end
+end
+
+#==============================================================================
+# ** Graphics - per-frame hook
+#==============================================================================
+class << Graphics
+  alias_method :afx_update, :update
+  def update
+    afx_update
+    AudioFX.update
+  end
+end
+
+#==============================================================================
+# ** Audio - swap track, keep position (seconds), optional fade-in (ms)
+#==============================================================================
+module Audio
+  def self.bgm_swap(sf, sv = RPG::BGM.last.volume, sp = RPG::BGM.last.pitch, fade = 0)
+    bgm_play(sf, sv, sp, bgm_pos, fade)
+  end
+
+  def self.bgs_swap(sf, sv = RPG::BGS.last.volume, sp = RPG::BGS.last.pitch, fade = 0)
+    bgs_play(sf, sv, sp, bgs_pos, fade)
+  end
+end
+
+#==============================================================================
+# ** Audio - loop points and jumps (see the notes at the top)
+#==============================================================================
+module Audio
+  def self.bgm_loop(start, finish = nil); AudioFX.set_loop(:bgm, start, finish); end
+  def self.bgm_loop_reset;                AudioFX.reset_loop(:bgm);              end
+  def self.bgm_jump(time);                AudioFX.jump(:bgm, time);              end
+  def self.bgs_loop(start, finish = nil); AudioFX.set_loop(:bgs, start, finish); end
+  def self.bgs_loop_reset;                AudioFX.reset_loop(:bgs);              end
+  def self.bgs_jump(time);                AudioFX.jump(:bgs, time);              end
+end
+
+class Game_System
+  attr_accessor :audiofx_loops          # { :bgm => [file, start_ms, end_ms] }
+end
+
+class Game_Interpreter
+  TIME_RX = /\d+(?::\d+){0,2}(?:\.\d+)?/
+
+  # Script command helpers
+  def bgm_loop(start, finish = nil); Audio.bgm_loop(start, finish); end
+  def bgm_loop_reset;                Audio.bgm_loop_reset;          end
+  def bgm_jump(time);                Audio.bgm_jump(time);          end
+  def bgs_loop(start, finish = nil); Audio.bgs_loop(start, finish); end
+  def bgs_loop_reset;                Audio.bgs_loop_reset;          end
+  def bgs_jump(time);                Audio.bgs_jump(time);          end
+
+  TAG_RX = /\A\s*(BGM|BGS)_(LOOP|JUMP)\s*:/i
+
+  # Script command: lines like  BGM_Jump: 3:44.651  are handled as tags
+  # (they are not valid Ruby); any other lines in the same command still run
+  # as normal Ruby.
+  alias audiofx_command_355 command_355
+  def command_355
+    lines = [@list[@index].parameters[0].to_s]
+    last = @index
+    while @list[last + 1] && @list[last + 1].code == 655
+      last += 1
+      lines.push(@list[last].parameters[0].to_s)
+    end
+    tags, rest = lines.partition { |l| l =~ TAG_RX }
+    return audiofx_command_355 if tags.empty?
+    tags.each { |l| audiofx_comment(l) }
+    @index = last
+    script = rest.join("\n")
+    eval(script + "\n") unless script.strip.empty?
+  end
+
+  # Comment command:  BGM_Loop: 1:24.45   BGM_Jump: 0:25   (also BGS_...)
+  alias audiofx_command_108 command_108
+  def command_108
+    audiofx_command_108
+    (@comments || []).each { |line| audiofx_comment(line.to_s) }
+  end
+
+  def audiofx_comment(line)
+    return unless line =~ /\A\s*(BGM|BGS)_(LOOP|JUMP)\s*:\s*(.*?)\s*\z/i
+    kind = $1.downcase.to_sym
+    cmd  = $2.downcase
+    arg  = $3
+    if cmd == "jump"
+      time = arg[TIME_RX]
+      AudioFX.jump(kind, time) if time
+    elsif arg =~ /\A(reset|off|none|clear)/i
+      AudioFX.reset_loop(kind)
+    else
+      times = arg.scan(TIME_RX)
+      AudioFX.set_loop(kind, times[0], times[1]) if times[0]
+    end
+  end
+end
